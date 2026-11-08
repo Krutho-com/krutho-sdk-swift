@@ -173,12 +173,35 @@ cut -c67- "$work/src_sums" | sort > "$work/src_listed"
 (cd "$source_dir" && find Sources -type f -print) | sort > "$work/src_present"
 [ -z "$(comm -23 "$work/src_present" "$work/src_listed")" ] || fail "Sources/ holds a file not listed in SHA256SUMS"
 
-# 10. Package.swift equals the canonical manifest, byte for byte. The manifest is
+# 10. The checkout's top level holds only expected entries, and Package.swift
+#     equals the canonical manifest, byte for byte. The manifest is
 #     not in SHA256SUMS; scripts/Package.swift.expected.in is rendered with this
 #     release's tag, version, zip name and zip hash, and the file must equal it.
 #     Nothing else in Package.swift is accepted: no extra dependency, target,
 #     flag, comment, conditional or string.
-step "10. Package.swift"
+step "10. top-level entries and Package.swift"
+# The checkout holds only the entries a release writes. SwiftPM also reads
+# Package@swift-X.Y.swift, Plugins/ and .swiftpm, so any other top-level entry,
+# any symlink and any other Package*.swift fails.
+find "$source_dir" -mindepth 1 -maxdepth 1 -print0 > "$work/top"
+while IFS= read -r -d '' entry; do
+  name="${entry##*/}"
+  [ ! -L "$entry" ] || fail "top-level entry is a symlink: $name"
+  case "$name" in
+    Package.swift|README.md|VERIFY.md|LICENSE|SECURITY.md|CHANGELOG.md) kind=f ;;
+    Sources|KEYS|scripts|notes) kind=d ;;
+    .git) kind=g ;;
+    CODEOWNERS|releases.json|releases.schema.json|SHA256SUMS|SHA256SUMS.sig) # git-delivered proof tree only
+      [ "$allow_path" = 1 ] || fail "unexpected top-level entry in the source checkout: $name"; kind=f ;;
+    Binaries|assets|spike)
+      [ "$allow_path" = 1 ] || fail "unexpected top-level entry in the source checkout: $name"; kind=d ;;
+    *) fail "unexpected top-level entry in the source checkout: $name" ;;
+  esac
+  case "$kind" in
+    f) [ -f "$entry" ] || fail "top-level entry is not a regular file: $name" ;;
+    d) [ -d "$entry" ] || fail "top-level entry is not a directory: $name" ;;
+  esac
+done < "$work/top"
 pkg="$source_dir/Package.swift"
 [ -f "$pkg" ] && [ ! -L "$pkg" ] || fail "no Package.swift in $source_dir"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
