@@ -19,7 +19,7 @@ Exactly two spaces separate hash and path. Krutho signs one list for each releas
 - `Binaries/CredentialSdkCore.xcframework/...`: the files inside the zip;
 - `Sources/...`: the Swift wrapper files in this repository at the release tag.
 
-**What the signature covers.** The zip, the framework files inside it and the `Sources/` files. `Package.swift` is not listed. It is bound to the release only through its binary target: one literal `checksum:` equal to the signed zip hash, and one `url:` naming this release's zip asset. Swift Package Manager refuses a downloaded zip whose checksum differs. Read the rest of `Package.swift` yourself: it is short, and the signature says nothing about it.
+**What the signature covers.** The zip, the framework files inside it and the `Sources/` files. `Package.swift` is not listed. It is bound to the release by exact comparison: the verifier renders `scripts/Package.swift.expected.in` with the release's tag, version, zip name and zip hash, and `Package.swift` at the tag must equal the result byte for byte. A manifest with any other dependency, target, flag, comment, conditional or string fails. Swift Package Manager also refuses a downloaded zip whose checksum differs from the one in the manifest.
 
 `scripts/verify-public.sh` runs every check below in order and stops at the first failure. Section 3 gives the same checks by hand and says where a manual step is weaker than the script.
 
@@ -39,7 +39,7 @@ gh release download sdk-v<version> -R Krutho-com/krutho-sdk-swift -D ../assets-<
   -p '*.xcframework.zip' -p SHA256SUMS -p SHA256SUMS.sig
 ```
 
-Without the GitHub CLI, download the same three files from the release page. The checkout of `main` supplies the current `KEYS/` and `scripts/`; the worktree supplies `Sources/` and `Package.swift` at the tag. Always use the current `KEYS/`: a tag's own copy predates any later revocation.
+Without the GitHub CLI, download the same three files from the release page. Run the verifier and its templates from the current `main`, never from the release checkout: the release checkout is what is being checked. The checkout of `main` supplies the current `KEYS/` and `scripts/`; the worktree supplies `Sources/` and `Package.swift` at the tag. Always use the current `KEYS/`: a tag's own copy predates any later revocation.
 
 ## 2. Run the verifier
 
@@ -57,7 +57,7 @@ Options:
 
 - `--keys DIR`: the current `KEYS/` directory. Default: `KEYS/` beside the script's directory.
 - `--verify-time YYYYMMDD`: check the signing certificate as of that date (see Certificate expiry below). The revocation list still applies.
-- `--allow-path-binary`: accept a `Package.swift` whose binary target is a committed `Binaries/CredentialSdkCore.xcframework` directory instead of the release zip, and check that directory against the `Binaries/` lines. Releases in this repository never use that form; the flag exists to check older releases that Krutho delivered by git.
+- `--allow-path-binary`: for an internal check of an older, git-delivered release. Public releases never need it.
 
 ## Certificate expiry
 
@@ -163,14 +163,24 @@ LC_ALL=C comm -23 "$W/src_present" "$W/src_listed"                    # prints n
 (cd "$SRC" && find Sources ! -type f ! -type d)                       # prints nothing
 ```
 
-**Step 10: `Package.swift`.** It must hold no block comment (`/*`), and the words `binaryTarget`, `checksum` and `url` must each appear exactly once. The `checksum:` line must carry the zip hash from step 7 as a literal string, and the `url:` line must name `https://github.com/Krutho-com/krutho-sdk-swift/releases/download/$TAG/$ZIP`.
+**Step 10: the top level and `Package.swift`.** First, the checkout may hold only the entries a release writes. Swift Package Manager also reads version-specific manifests (`Package@swift-5.9.swift` and the like), `Plugins/` and `.swiftpm`, so none of those may exist, and no top-level entry may be a symlink. Both commands must print nothing:
 
 ```sh
-grep -c '/\*' "$SRC/Package.swift"                 # prints 0
-grep -c -E 'binaryTarget' "$SRC/Package.swift"     # prints 1
-grep -n -E 'checksum|url' "$SRC/Package.swift"     # exactly two lines:
-#   checksum: "<zip hash from step 7>"
-#   url: "https://github.com/Krutho-com/krutho-sdk-swift/releases/download/<tag>/<zip name>"
+find "$SRC" -mindepth 1 -maxdepth 1 ! \( -name .git -o -name Package.swift -o -name Sources -o -name KEYS \
+  -o -name scripts -o -name notes -o -name README.md -o -name VERIFY.md -o -name LICENSE \
+  -o -name SECURITY.md -o -name CHANGELOG.md \) -print
+find "$SRC" -mindepth 1 -maxdepth 1 -type l -print
+```
+
+The script also checks that each directory name is a directory and each file name a regular file. Second, render the canonical manifest and compare it with the file. The template carries five placeholders: `@VERSION@`, `@TAG@`, `@PUBLIC_REPO@` (always `Krutho-com/krutho-sdk-swift`), `@ZIP@` and `@CHECKSUM@` (the zip hash from step 7). The two files must be identical, byte for byte; any difference fails, whatever it is.
+
+```sh
+ZIPSUM=$(shasum -a 256 "$A/$ZIP" | cut -d' ' -f1)
+sed -e "s|@VERSION@|$V|g" -e "s|@TAG@|$TAG|g" -e "s|@PUBLIC_REPO@|Krutho-com/krutho-sdk-swift|g" \
+  -e "s|@ZIP@|$ZIP|g" -e "s|@CHECKSUM@|$ZIPSUM|g" scripts/Package.swift.expected.in > "$W/Package.swift.expected"
+grep -c '@[A-Z_]*@' "$W/Package.swift.expected"    # prints 0
+cmp "$W/Package.swift.expected" "$SRC/Package.swift"   # prints nothing, exits 0
+diff -u "$W/Package.swift.expected" "$SRC/Package.swift"   # shows any difference
 ```
 
 `swift package compute-checksum "$A/$ZIP"` prints the value Swift Package Manager checks at resolve time; it equals the SHA-256 of the zip.
@@ -190,7 +200,7 @@ For an annotated tag, take the line ending `^{}`. All three commits must be equa
 
 ## What this does not cover
 
-- **Files outside the zip, `Sources/` and the binary target.** The verifier checks no other file in this repository, and no other line of `SHA256SUMS`.
+- **What the other files hold.** The verifier checks the names of the top-level entries, but not the contents of `README.md`, `scripts/`, `notes/` and the other top-level files, and no other line of `SHA256SUMS`. The contents of `KEYS/` are pinned to the root key you hold.
 - **Revocation floor.** The verifier checks that the revocation statement is signed and unexpired. It does not store the highest statement sequence you have accepted, so it cannot refuse an older, unexpired statement. Fetch `KEYS/` from the current `main` each time.
 - **Recovery records.** If Krutho revokes a signing key, step 5 fails for every release that key signed. Krutho then publishes a replacement release and notifies customers out of band.
 - **Withdrawal.** A withdrawn release still verifies. Krutho announces every withdrawal out of band.

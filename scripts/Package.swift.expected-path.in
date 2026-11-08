@@ -1,0 +1,37 @@
+// swift-tools-version: 5.9
+// Krutho credential SDK @VERSION@ (release @TAG@).
+// The compiled core is committed at this release commit as
+// Binaries/CredentialSdkCore.xcframework; Swift Package Manager reads it from
+// the checkout, so a git clone delivers everything.
+import PackageDescription
+
+let package = Package(
+    name: "CredentialSdk",
+    platforms: [.iOS(.v13), .macOS(.v13)],
+    products: [
+        .library(name: "CredentialSdk", targets: ["CredentialSdk"])
+    ],
+    targets: [
+        .binaryTarget(
+            name: "CredentialSdkCore",
+            path: "Binaries/CredentialSdkCore.xcframework"
+        ),
+        .target(
+            name: "CredentialSdkCoreBindings",
+            dependencies: ["CredentialSdkCore"],
+            path: "Sources/CredentialSdkCoreBindings"
+        ),
+        .target(
+            name: "CredentialSdk",
+            dependencies: ["CredentialSdkCoreBindings"],
+            path: "Sources/CredentialSdk",
+            resources: [
+                .copy("Resources/device-pattern-v1")
+            ],
+            linkerSettings: [
+                .linkedFramework("Security"),
+                .linkedFramework("DeviceCheck")
+            ]
+        )
+    ]
+)

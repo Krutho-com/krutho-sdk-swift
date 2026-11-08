@@ -11,8 +11,9 @@
 # --verify-time  check the signing certificate as of that date, for a release
 #                signed by a certificate that has since expired
 # --allow-path-binary
-#                accept a Package.swift whose binary target is the committed
-#                Binaries/ directory (path: form) instead of the release zip;
+#                accept the canonical git-delivered manifest (scripts/
+#                Package.swift.expected-path.in), whose binary target is the
+#                committed Binaries/ directory, instead of the release zip;
 #                for checking an older git-delivered release only
 #
 # Last line `verified` and exit 0 on success. Any failed check, and any
@@ -172,17 +173,54 @@ cut -c67- "$work/src_sums" | sort > "$work/src_listed"
 (cd "$source_dir" && find Sources -type f -print) | sort > "$work/src_present"
 [ -z "$(comm -23 "$work/src_present" "$work/src_listed")" ] || fail "Sources/ holds a file not listed in SHA256SUMS"
 
-# 10. Package.swift binds the zip: one binary target, one literal checksum equal
-#     to the zip hash, one url to this release's asset. No block comments.
-step "10. Package.swift"
+# 10. The checkout's top level holds only expected entries, and Package.swift
+#     equals the canonical manifest, byte for byte. The manifest is
+#     not in SHA256SUMS; scripts/Package.swift.expected.in is rendered with this
+#     release's tag, version, zip name and zip hash, and the file must equal it.
+#     Nothing else in Package.swift is accepted: no extra dependency, target,
+#     flag, comment, conditional or string.
+step "10. top-level entries and Package.swift"
+# The checkout holds only the entries a release writes. SwiftPM also reads
+# Package@swift-X.Y.swift, Plugins/ and .swiftpm, so any other top-level entry,
+# any symlink and any other Package*.swift fails.
+find "$source_dir" -mindepth 1 -maxdepth 1 -print0 > "$work/top"
+while IFS= read -r -d '' entry; do
+  name="${entry##*/}"
+  [ ! -L "$entry" ] || fail "top-level entry is a symlink: $name"
+  case "$name" in
+    Package.swift|README.md|VERIFY.md|LICENSE|SECURITY.md|CHANGELOG.md) kind=f ;;
+    Sources|KEYS|scripts|notes) kind=d ;;
+    .git) kind=g ;;
+    CODEOWNERS|releases.json|releases.schema.json|SHA256SUMS|SHA256SUMS.sig) # git-delivered proof tree only
+      [ "$allow_path" = 1 ] || fail "unexpected top-level entry in the source checkout: $name"; kind=f ;;
+    Binaries|assets|spike)
+      [ "$allow_path" = 1 ] || fail "unexpected top-level entry in the source checkout: $name"; kind=d ;;
+    *) fail "unexpected top-level entry in the source checkout: $name" ;;
+  esac
+  case "$kind" in
+    f) [ -f "$entry" ] || fail "top-level entry is not a regular file: $name" ;;
+    d) [ -d "$entry" ] || fail "top-level entry is not a directory: $name" ;;
+  esac
+done < "$work/top"
 pkg="$source_dir/Package.swift"
 [ -f "$pkg" ] && [ ! -L "$pkg" ] || fail "no Package.swift in $source_dir"
-count() { grep -c -E "$1" "$pkg" || true; }
-[ "$(count '/\*')" = 0 ] || fail "Package.swift holds a block comment"
-[ "$(count 'binaryTarget')" = 1 ] || fail "Package.swift must declare exactly one binaryTarget"
-if [ "$allow_path" = 1 ] && [ "$(count 'checksum')" = 0 ] && [ "$(count 'url')" = 0 ]; then
-  [ "$(count '^[[:space:]]*path: "Binaries/CredentialSdkCore\.xcframework"[[:space:]]*,?[[:space:]]*$')" = 1 ] \
-    || fail "Package.swift binary target is not path: \"Binaries/CredentialSdkCore.xcframework\""
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+render() {
+  [ -f "$1" ] && [ ! -L "$1" ] || fail "missing or not a regular file: $1"
+  sed -e "s|@VERSION@|${version}|g" -e "s|@TAG@|${tag}|g" -e "s|@PUBLIC_REPO@|Krutho-com/krutho-sdk-swift|g" \
+    -e "s|@ZIP@|${zipname}|g" -e "s|@CHECKSUM@|${zipsum}|g" "$1" > "$2"
+  ! grep -q '@[A-Z_]*@' "$2" || fail "canonical manifest template holds an unreplaced placeholder"
+}
+show_diff() { diff -u "$1" "$pkg" | cat -v | head -n 20 >&2 || true; }
+render "$script_dir/Package.swift.expected.in" "$work/Package.swift.expected"
+if cmp -s "$work/Package.swift.expected" "$pkg"; then
+  step "   Package.swift equals the canonical manifest for $tag"
+elif [ "$allow_path" = 1 ]; then
+  render "$script_dir/Package.swift.expected-path.in" "$work/Package.swift.expected-path"
+  if ! cmp -s "$work/Package.swift.expected-path" "$pkg"; then
+    show_diff "$work/Package.swift.expected-path"
+    fail "Package.swift is neither the canonical manifest nor the canonical path: manifest for $tag"
+  fi
   sed 's|  |  Binaries/|' "$work/bin_sums" > "$work/bin_sums.path"
   (cd "$source_dir" && sha256_check "$work/bin_sums.path") >/dev/null 2>&1 \
     || fail "a committed Binaries/ file does not match its SHA256SUMS line"
@@ -191,13 +229,8 @@ if [ "$allow_path" = 1 ] && [ "$(count 'checksum')" = 0 ] && [ "$(count 'url')" 
   [ -z "$(cd "$source_dir" && find Binaries \( -type l -o \( ! -type f ! -type d \) \) -print)" ] || fail "Binaries/ holds a symlink or special file"
   step "   path: form accepted (--allow-path-binary); committed Binaries/ checked"
 else
-  url_want="https://github.com/Krutho-com/krutho-sdk-swift/releases/download/${tag}/${zipname}"
-  [ "$(count 'checksum')" = 1 ] || fail "Package.swift must mention checksum exactly once"
-  [ "$(count "^[[:space:]]*checksum: \"${zipsum}\"[[:space:]]*,?[[:space:]]*\$")" = 1 ] \
-    || fail "Package.swift checksum is not the literal zip hash $zipsum"
-  [ "$(count 'url')" = 1 ] || fail "Package.swift must mention url exactly once"
-  [ "$(count "^[[:space:]]*url: \"${url_want//./\\.}\"[[:space:]]*,?[[:space:]]*\$")" = 1 ] \
-    || fail "Package.swift url is not $url_want"
+  show_diff "$work/Package.swift.expected"
+  fail "Package.swift differs from the canonical manifest for $tag"
 fi
 
 echo verified
