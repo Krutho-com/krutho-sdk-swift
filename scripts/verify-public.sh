@@ -3,23 +3,30 @@
 #
 #   scripts/verify-public.sh --assets DIR --tag sdk-vX.Y.Z \
 #     --root-fingerprint 'SHA256:<fingerprint from Krutho>' \
-#     [--keys DIR] [--source DIR]
+#     --source DIR [--keys DIR] [--verify-time YYYYMMDD]
 #
-# --assets  directory holding the release zip, SHA256SUMS and SHA256SUMS.sig
-# --keys    the current KEYS/ directory (default: KEYS/ beside scripts/)
-# --source  a checkout of this repository at the release tag; checks the
-#           Sources/ lines and the Package.swift checksum
+# --assets       directory holding the release zip, SHA256SUMS and SHA256SUMS.sig
+# --source       a checkout of this repository at the release tag
+# --keys         the current KEYS/ directory (default: KEYS/ beside scripts/)
+# --verify-time  check the signing certificate as of that date, for a release
+#                signed by a certificate that has since expired
+# --allow-path-binary
+#                accept a Package.swift whose binary target is the committed
+#                Binaries/ directory (path: form) instead of the release zip;
+#                for checking an older git-delivered release only
 #
-# Last line `verified` and exit 0 on success. `FAIL: <cause>` and exit 1 on any
-# failed check. Exit 2 on a usage error. VERIFY.md gives the same steps by hand.
-set -euo pipefail
+# Last line `verified` and exit 0 on success. Any failed check, and any
+# unexpected error, prints `FAIL: <cause>` as the last line and exits 1. A usage
+# error exits 2. VERIFY.md gives the same steps by hand.
+set -eEuo pipefail
 export LC_ALL=C
 
 fail() { printf 'FAIL: %s\n' "$*"; exit 1; }
-usage() { printf 'usage: %s --assets DIR --tag sdk-vX.Y.Z --root-fingerprint SHA256:... [--keys DIR] [--source DIR]\n' "$0" >&2; exit 2; }
+trap 'printf "FAIL: unexpected error at line %s\n" "$LINENO"; exit 1' ERR
+usage() { printf 'usage: %s --assets DIR --tag sdk-vX.Y.Z --root-fingerprint SHA256:... --source DIR [--keys DIR] [--verify-time YYYYMMDD] [--allow-path-binary]\n' "$0" >&2; exit 2; }
 step() { printf '%s\n' "$*"; }
 
-assets="" tag="" fpr="" keys="" source_dir=""
+assets="" tag="" fpr="" keys="" source_dir="" verify_time="" allow_path=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --assets) [ $# -ge 2 ] || usage; assets="$2"; shift 2 ;;
@@ -27,18 +34,37 @@ while [ $# -gt 0 ]; do
     --root-fingerprint) [ $# -ge 2 ] || usage; fpr="$2"; shift 2 ;;
     --keys) [ $# -ge 2 ] || usage; keys="$2"; shift 2 ;;
     --source) [ $# -ge 2 ] || usage; source_dir="$2"; shift 2 ;;
+    --verify-time) [ $# -ge 2 ] || usage; verify_time="$2"; shift 2 ;;
+    --allow-path-binary) allow_path=1; shift ;;
     *) usage ;;
   esac
 done
-[ -n "$assets" ] && [ -n "$tag" ] && [ -n "$fpr" ] || usage
+[ -n "$assets" ] && [ -n "$tag" ] && [ -n "$fpr" ] && [ -n "$source_dir" ] || usage
 [[ "$tag" =~ ^sdk-v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "tag must look like sdk-v1.2.3" >&2; exit 2; }
 version="${BASH_REMATCH[1]}"
+if [ -n "$verify_time" ] && ! [[ "$verify_time" =~ ^[0-9]{8}([0-9]{4}([0-9]{2})?)?Z?$ ]]; then
+  echo "verify time must be YYYYMMDD[HHMM[SS]][Z]" >&2; exit 2
+fi
 [ -n "$keys" ] || keys="$(cd "$(dirname "$0")/.." && pwd)/KEYS"
-[ -d "$assets" ] || usage
+[ -d "$assets" ] || fail "no assets directory at $assets"
+[ -d "$source_dir" ] || fail "no source checkout at $source_dir"
 [ -d "$keys" ] || fail "no KEYS directory at $keys"
+for k in release-root.pub revocation.txt revocation.txt.sig revoked.krl; do
+  [ -f "$keys/$k" ] && [ ! -L "$keys/$k" ] || fail "missing or not a regular file: $keys/$k"
+done
+for t in ssh-keygen unzip zipinfo awk sed sort comm uniq find; do
+  command -v "$t" >/dev/null 2>&1 || fail "required tool not found: $t"
+done
 
-if command -v sha256sum >/dev/null 2>&1; then sha256() { sha256sum "$1" | cut -d' ' -f1; }
-else sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }; fi
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum "$1" | cut -d' ' -f1; }
+  sha256_check() { sha256sum -c --quiet "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
+  sha256_check() { shasum -a 256 -c --quiet "$1"; }
+else
+  fail "neither sha256sum nor shasum found"
+fi
 
 zipname="krutho-credential-sdk-${version}-CredentialSdkCore.xcframework.zip"
 zip="$assets/$zipname"
@@ -48,13 +74,15 @@ for f in "$zip" "$sums" "$sig"; do
   [ -f "$f" ] && [ ! -L "$f" ] || fail "missing or not a regular file: $f"
 done
 
-work="$(mktemp -d)"
+work="$(mktemp -d 2>/dev/null)" || fail "cannot create a temporary directory"
+[ -n "$work" ] && [ -d "$work" ] || fail "cannot create a temporary directory"
 trap 'rm -rf "$work"' EXIT
 
 # 1. Root key pin.
 step "1. root key pin"
-[ "$(grep -c . "$keys/release-root.pub")" = 1 ] || fail "release-root.pub must hold exactly one key"
-got="$(ssh-keygen -l -E sha256 -f "$keys/release-root.pub" | cut -d' ' -f2)"
+[ "$(grep -c . "$keys/release-root.pub" || true)" = 1 ] || fail "release-root.pub must hold exactly one key"
+got="$(ssh-keygen -l -E sha256 -f "$keys/release-root.pub" 2>/dev/null | cut -d' ' -f2)" || fail "release-root.pub is not a valid public key"
+[ -n "$got" ] || fail "release-root.pub is not a valid public key"
 [ "$got" = "$fpr" ] || fail "root key fingerprint $got does not match $fpr"
 rootkey="$(cut -d' ' -f1,2 "$keys/release-root.pub")"
 
@@ -65,12 +93,13 @@ ssh-keygen -Y verify -f "$work/allowed_root" -I krutho-root -n krutho-revocation
   -s "$keys/revocation.txt.sig" < "$keys/revocation.txt" >/dev/null 2>&1 \
   || fail "revocation.txt signature does not verify against the root key"
 
-# 3. The revocation list is the one the statement names, and parses as a KRL.
+# 3. The statement's form; the revocation list is the one it names and parses as a KRL.
 step "3. revocation list"
-bad="$(grep -v -E '^(sequence: [1-9][0-9]*|issued: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|next_update: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|krl_sha256: [0-9a-f]{64}|recovery_sha256: [0-9a-f]{64})$' "$keys/revocation.txt" || true)"
-[ -z "$bad" ] || fail "revocation.txt has an unexpected line"
+if grep -v -E '^(sequence: [1-9][0-9]*|issued: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|next_update: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|krl_sha256: [0-9a-f]{64}|recovery_sha256: [0-9a-f]{64})$' "$keys/revocation.txt" >/dev/null; then
+  fail "revocation.txt has an unexpected line"
+fi
 for k in sequence issued next_update krl_sha256; do
-  [ "$(grep -c "^$k: " "$keys/revocation.txt")" = 1 ] || fail "revocation.txt must carry exactly one $k line"
+  [ "$(grep -c "^$k: " "$keys/revocation.txt" || true)" = 1 ] || fail "revocation.txt must carry exactly one $k line"
 done
 krl_want="$(sed -n 's/^krl_sha256: //p' "$keys/revocation.txt")"
 [ "$(sha256 "$keys/revoked.krl")" = "$krl_want" ] || fail "revoked.krl does not match krl_sha256"
@@ -87,14 +116,17 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 5. Release signature, always with the revocation list.
 step "5. release signature"
 printf 'krutho-release cert-authority,namespaces="krutho-release" %s\n' "$rootkey" > "$work/allowed_signers"
+vt=()
+[ -z "$verify_time" ] || vt=(-O "verify-time=$verify_time")
 ssh-keygen -Y verify -f "$work/allowed_signers" -I krutho-release -n krutho-release \
-  -s "$sig" -r "$keys/revoked.krl" < "$sums" >/dev/null 2>&1 \
-  || fail "SHA256SUMS.sig does not verify (or its signer is revoked): contact Krutho"
+  -s "$sig" -r "$keys/revoked.krl" ${vt[@]+"${vt[@]}"} < "$sums" >/dev/null 2>&1 \
+  || fail "SHA256SUMS.sig does not verify: signer revoked, certificate expired (see --verify-time), or files changed; contact Krutho"
 
 # 6. SHA256SUMS form and tag.
 step "6. SHA256SUMS form and tag"
 [ "$(head -n 1 "$sums")" = "# tag: $tag" ] || fail "SHA256SUMS is signed for '$(head -n 1 "$sums")', not '# tag: $tag'"
 tail -n +2 "$sums" > "$work/sums"
+[ -s "$work/sums" ] || fail "SHA256SUMS lists no files"
 if grep -v -E '^[0-9a-f]{64}  [A-Za-z0-9._+@-][A-Za-z0-9._+@/-]*$' "$work/sums" >/dev/null; then fail "malformed SHA256SUMS line"; fi
 if cut -c67- "$work/sums" | grep -E '(^|/)\.{1,2}(/|$)|//|/$|^SHA256SUMS(\.sig)?$' >/dev/null; then fail "unsafe path in SHA256SUMS"; fi
 cut -c67- "$work/sums" | sort > "$work/listed"
@@ -108,41 +140,64 @@ want="$(awk -v p="$zipline" 'substr($0,67)==p {print substr($0,1,64)}' "$work/su
 zipsum="$(sha256 "$zip")"
 [ "$zipsum" = "$want" ] || fail "zip hash $zipsum does not match SHA256SUMS ($want)"
 
-# 8. The XCFramework inside the zip against the Binaries/ lines.
+# 8. The XCFramework inside the zip against the Binaries/ lines. Entries are
+#    checked from the listing before anything is extracted.
 step "8. XCFramework contents"
-unzip -Z1 "$zip" > "$work/entries" || fail "cannot list the zip"
+zipinfo -1 "$zip" > "$work/entries" 2>/dev/null || fail "cannot list the zip"
+[ -s "$work/entries" ] || fail "the zip is empty"
 if grep -v -E '^CredentialSdkCore\.xcframework/' "$work/entries" >/dev/null; then fail "zip entry outside CredentialSdkCore.xcframework/"; fi
-if grep -E '(^|/)\.\.(/|$)|^/' "$work/entries" >/dev/null; then fail "unsafe zip entry"; fi
+if grep -E '(^|/)\.\.(/|$)|^/|\\|//' "$work/entries" >/dev/null; then fail "unsafe zip entry name"; fi
+if grep -v -E '^[A-Za-z0-9._+@/-]+$' "$work/entries" >/dev/null; then fail "zip entry name with an unexpected character"; fi
+zipinfo "$zip" 2>/dev/null | sed '1,2d;$d' | awk '{print substr($1,1,1)}' > "$work/types" || fail "cannot read zip entry types"
+[ "$(wc -l < "$work/types")" -eq "$(wc -l < "$work/entries")" ] || fail "zip listing is inconsistent"
+if grep -v -E '^[-d]$' "$work/types" >/dev/null; then fail "zip listing holds a symlink, special file or untyped entry"; fi
 mkdir "$work/x"
-unzip -q "$zip" -d "$work/x" || fail "cannot extract the zip"
+unzip -q "$zip" -d "$work/x" >/dev/null 2>&1 || fail "cannot extract the zip"
 [ -z "$(cd "$work/x" && find . \( -type l -o \( ! -type f ! -type d \) \) -print)" ] || fail "zip holds a symlink or special file"
-grep -E '  Binaries/' "$work/sums" | sed 's|  Binaries/|  |' > "$work/bin_sums"
-[ -s "$work/bin_sums" ] || fail "SHA256SUMS has no Binaries/ lines"
-(cd "$work/x" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c --quiet "$work/bin_sums"; else shasum -a 256 -c --quiet "$work/bin_sums"; fi) >/dev/null 2>&1 \
+grep -E '  Binaries/' "$work/sums" | sed 's|  Binaries/|  |' > "$work/bin_sums" || fail "SHA256SUMS has no Binaries/ lines"
+(cd "$work/x" && sha256_check "$work/bin_sums") >/dev/null 2>&1 \
   || fail "an XCFramework file does not match its Binaries/ line"
 cut -c67- "$work/bin_sums" | sort > "$work/bin_listed"
 (cd "$work/x" && find . -type f -print) | sed 's|^\./||' | sort > "$work/bin_present"
 [ -z "$(comm -23 "$work/bin_present" "$work/bin_listed")" ] || fail "zip holds a file not listed in SHA256SUMS"
 
-# 9. Sources/ and Package.swift, when a checkout of the tag is given.
-if [ -n "$source_dir" ]; then
-  step "9. Sources/ and Package.swift"
-  [ -d "$source_dir/Sources" ] || fail "no Sources/ in $source_dir"
-  grep -E '  Sources/' "$work/sums" > "$work/src_sums" || fail "SHA256SUMS has no Sources/ lines"
-  (cd "$source_dir" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c --quiet "$work/src_sums"; else shasum -a 256 -c --quiet "$work/src_sums"; fi) >/dev/null 2>&1 \
-    || fail "a Sources/ file does not match its SHA256SUMS line"
-  [ -z "$(cd "$source_dir" && find Sources \( -type l -o \( ! -type f ! -type d \) \) -print)" ] || fail "Sources/ holds a symlink or special file"
-  cut -c67- "$work/src_sums" | sort > "$work/src_listed"
-  (cd "$source_dir" && find Sources -type f -print) | sort > "$work/src_present"
-  [ -z "$(comm -23 "$work/src_present" "$work/src_listed")" ] || fail "Sources/ holds a file not listed in SHA256SUMS"
-  if grep -q 'checksum: *"' "$source_dir/Package.swift" 2>/dev/null; then
-    pkgsum="$(sed -n 's/.*checksum: *"\([0-9a-f]\{64\}\)".*/\1/p' "$source_dir/Package.swift")"
-    [ "$pkgsum" = "$zipsum" ] || fail "Package.swift checksum $pkgsum does not match the zip ($zipsum)"
-  else
-    step "   Package.swift carries no binary checksum; checksum comparison skipped"
-  fi
+# 9. Sources/ at the tag.
+step "9. Sources/"
+[ -d "$source_dir/Sources" ] || fail "no Sources/ in $source_dir"
+grep -E '  Sources/' "$work/sums" > "$work/src_sums" || fail "SHA256SUMS has no Sources/ lines"
+(cd "$source_dir" && sha256_check "$work/src_sums") >/dev/null 2>&1 \
+  || fail "a Sources/ file does not match its SHA256SUMS line"
+[ -z "$(cd "$source_dir" && find Sources \( -type l -o \( ! -type f ! -type d \) \) -print)" ] || fail "Sources/ holds a symlink or special file"
+cut -c67- "$work/src_sums" | sort > "$work/src_listed"
+(cd "$source_dir" && find Sources -type f -print) | sort > "$work/src_present"
+[ -z "$(comm -23 "$work/src_present" "$work/src_listed")" ] || fail "Sources/ holds a file not listed in SHA256SUMS"
+
+# 10. Package.swift binds the zip: one binary target, one literal checksum equal
+#     to the zip hash, one url to this release's asset. No block comments.
+step "10. Package.swift"
+pkg="$source_dir/Package.swift"
+[ -f "$pkg" ] && [ ! -L "$pkg" ] || fail "no Package.swift in $source_dir"
+count() { grep -c -E "$1" "$pkg" || true; }
+[ "$(count '/\*')" = 0 ] || fail "Package.swift holds a block comment"
+[ "$(count 'binaryTarget')" = 1 ] || fail "Package.swift must declare exactly one binaryTarget"
+if [ "$allow_path" = 1 ] && [ "$(count 'checksum')" = 0 ] && [ "$(count 'url')" = 0 ]; then
+  [ "$(count '^[[:space:]]*path: "Binaries/CredentialSdkCore\.xcframework"[[:space:]]*,?[[:space:]]*$')" = 1 ] \
+    || fail "Package.swift binary target is not path: \"Binaries/CredentialSdkCore.xcframework\""
+  sed 's|  |  Binaries/|' "$work/bin_sums" > "$work/bin_sums.path"
+  (cd "$source_dir" && sha256_check "$work/bin_sums.path") >/dev/null 2>&1 \
+    || fail "a committed Binaries/ file does not match its SHA256SUMS line"
+  (cd "$source_dir" && find Binaries -type f -print) | sed 's|^Binaries/||' | sort > "$work/srcbin_present"
+  [ -z "$(comm -23 "$work/srcbin_present" "$work/bin_listed")" ] || fail "Binaries/ holds a file not listed in SHA256SUMS"
+  [ -z "$(cd "$source_dir" && find Binaries \( -type l -o \( ! -type f ! -type d \) \) -print)" ] || fail "Binaries/ holds a symlink or special file"
+  step "   path: form accepted (--allow-path-binary); committed Binaries/ checked"
 else
-  step "9. skipped: no --source checkout given; Sources/ not checked"
+  url_want="https://github.com/Krutho-com/krutho-sdk-swift/releases/download/${tag}/${zipname}"
+  [ "$(count 'checksum')" = 1 ] || fail "Package.swift must mention checksum exactly once"
+  [ "$(count "^[[:space:]]*checksum: \"${zipsum}\"[[:space:]]*,?[[:space:]]*\$")" = 1 ] \
+    || fail "Package.swift checksum is not the literal zip hash $zipsum"
+  [ "$(count 'url')" = 1 ] || fail "Package.swift must mention url exactly once"
+  [ "$(count "^[[:space:]]*url: \"${url_want//./\\.}\"[[:space:]]*,?[[:space:]]*\$")" = 1 ] \
+    || fail "Package.swift url is not $url_want"
 fi
 
 echo verified

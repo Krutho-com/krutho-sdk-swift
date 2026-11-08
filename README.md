@@ -50,7 +50,6 @@ Every release carries `SHA256SUMS` and an OpenSSH signature over it, `SHA256SUMS
 | `scripts/verify-public.sh` | Verifier for a downloaded release |
 | `LICENSE` | Terms of use |
 | `SECURITY.md` | How to report a security issue |
-| `CODEOWNERS` | Repository review settings; not part of the SDK |
 
 ## License
 
