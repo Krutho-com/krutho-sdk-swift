@@ -1,0 +1,4 @@
+sequence: 1
+issued: 2026-11-06T23:24:49Z
+next_update: 2027-12-06T23:24:49Z
+krl_sha256: 0ffbecac27e31f56aede8f562664989b04d1304006e7e3e0de3b5aae719ba82c
